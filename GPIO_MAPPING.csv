@@ -1,0 +1,15 @@
+GPIO_Number,Function,Type,Direction,Voltage,Pull-Up,Description,Device_Connected
+0,BTN_START,Button,Input,3.3V,Internal,Bouton MARCHE - Active LOW,Push Button
+1,BTN_STOP,Button,Input,3.3V,Internal,Bouton ARRÊT - Active LOW,Push Button
+2,BTN_EMERGENCY,Button,Input,3.3V,Internal,Bouton ARRÊT RAPIDE - Active LOW,Push Button
+3,SW_AUTO_MANUAL,Switch,Input,3.3V,Internal,Interrupteur AUTO/MANUEL - LOW=AUTO HIGH=MANUEL,Toggle Switch
+4,SW_DIRECTION,Switch,Input,3.3V,Internal,Interrupteur DIRECTION - LOW=AVANT HIGH=ARRIERE,Toggle Switch
+5,ENCODER_CLK,Encoder,Input,3.3V,Internal,Encodeur rotatif CLK - Interrupt,KY-040 Encoder
+6,ENCODER_DT,Encoder,Input,3.3V,Internal,Encodeur rotatif DT - Lecture direction,KY-040 Encoder
+7,ENCODER_SW,Button,Input,3.3V,Internal,Encodeur rotatif bouton - Fine/Coarse mode,KY-040 Encoder
+8,STEPPER_STEP,Motor,Output,3.3V,None,Signal STEP vers driver moteur,DRV8825/TB6600
+9,STEPPER_DIR,Motor,Output,3.3V,None,Signal DIRECTION vers driver moteur,DRV8825/TB6600
+10,STEPPER_ENABLE,Motor,Output,3.3V,None,Signal ENABLE vers driver moteur (Active LOW),DRV8825/TB6600
+12,I2C_SDA,Communication,I/O,3.3V,External,I2C Données - Écran OLED,ELEGOO SSD1306
+13,I2C_SCL,Communication,I/O,3.3V,External,I2C Horloge - Écran OLED,ELEGOO SSD1306
+26,PAL_INPUT,Analog Input,Input,3.3V,None,Entrée signal PAL 50Hz (ADC0) - Filtre RC,Camera PAL
