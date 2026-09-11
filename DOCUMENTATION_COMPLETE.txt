@@ -1,0 +1,837 @@
+================================================================================
+RP2040-ZERO PAL STEPPER MOTOR CONTROLLER
+Contrôleur de moteur pas à pas synchronisé PAL pour Waveshare RP2040-Zero
+================================================================================
+
+VERSION: 1.0.0
+DATE: Septembre 2026
+AUTEUR: Développement Arduino RP2040
+LICENCE: Informatif - À adapter selon besoins
+
+================================================================================
+SECTION 1: SCHÉMA D'ENSEMBLE DU PROJET
+================================================================================
+
+                        ┌─────────────────────────────────────┐
+                        │  RP2040-ZERO (Waveshare)            │
+                        │  CPU: ARM Cortex-M0+ 125MHz         │
+                        │  RAM: 264KB | Flash: 2MB            │
+                        └──────────────┬──────────────────────┘
+                                       │
+        ┌──────────────────────────────┼──────────────────────────────┐
+        │                              │                              │
+    ┌───▼────┐         ┌──────────────▼──────────────┐          ┌────▼────┐
+    │ CAMÉRA │         │   CONTRÔLE & TRAITEMENT     │          │  ÉCRAN  │
+    │  PAL   │         │  (GPIO Entrées)             │          │  OLED   │
+    │ 50Hz   │         │                             │          │  I2C    │
+    └───┬────┘         └──────────────┬──────────────┘          └────┬────┘
+        │                              │                              │
+        │ Signal 50Hz (GPIO 26)        │ (GPIO 0-10, 12-13)         │
+        │                              │                              │
+        └──────────────┬───────────────┼───────────────┬─────────────┘
+                       │               │               │
+                   (ADC)          Boutons          I2C (GPIO 12-13)
+                                 Encodeur         Tension: 3.3V
+                                 Switch           Adresse: 0x3C
+                                 
+                       │               │               │
+                       ▼               ▼               ▼
+        ┌──────────────────────────────────────────────────────┐
+        │           TRAITEMENT PRINCIPAL (Loop)                │
+        │                                                      │
+        │  • Lecture des entrées (10ms)                       │
+        │  • Gestion des événements (boutons, encodeur)      │
+        │  • Calcul de la rampe (accélération/décélération)  │
+        │  • Synchronisation PAL (si AUTO)                   │
+        │  • Mise à jour de l'affichage (200ms)             │
+        └──────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+        ┌──────────────────────────────────────────────────────┐
+        │         GÉNÉRATION DE SIGNAUX MOTEUR                 │
+        │                                                      │
+        │  • Calcul intervalle entre STEP                    │
+        │  • Direction (GPIO 9)                              │
+        │  • Enable/Disable (GPIO 10, Active LOW)            │
+        │  • Pulse STEP (GPIO 8)                             │
+        └──────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+        ┌──────────────────────────────────────────────────────┐
+        │              DRIVER MOTEUR                           │
+        │         (DRV8825 ou TB6600)                         │
+        │                                                      │
+        │  • Réception STEP, DIR, ENABLE                     │
+        │  • Génération courants bobines                      │
+        │  • Protection surcharge/court-circuit               │
+        └──────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+        ┌──────────────────────────────────────────────────────┐
+        │         MOTEUR PAS À PAS NEMA17/23/34                │
+        │                                                      │
+        │  • 4 bobines (A+, A-, B+, B-)                       │
+        │  • Rotation synchrone                               │
+        │  • Charge mécanique contrôlée                       │
+        └──────────────────────────────────────────────────────┘
+
+================================================================================
+SECTION 2: ASSIGNATION DES GPIO ET CONNEXIONS
+================================================================================
+
+RÉSUMÉ RAPIDE:
+└─ ENTRÉES (14 GPIO):
+   ├─ Boutons: GPIO 0, 1, 2 (3 pins)
+   ├─ Interrupteurs: GPIO 3, 4 (2 pins)
+   ├─ Encodeur: GPIO 5, 6, 7 (3 pins)
+   ├─ PAL Input: GPIO 26 (1 pin)
+   └─ I2C: GPIO 12, 13 (2 pins)
+   
+└─ SORTIES (3 GPIO):
+   └─ Moteur: GPIO 8, 9, 10 (3 pins)
+
+================================================================================
+TABLEAU DÉTAILLÉ DES GPIO
+================================================================================
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│ GPIO | FONCTION          | TYPE      | DIRECTION | TENSION | PU | STATUS  │
+├────────────────────────────────────────────────────────────────────────────┤
+│  0   │ BTN_START         │ Button    │ Input     │ 3.3V    │ ✓  │ Marche  │
+│  1   │ BTN_STOP          │ Button    │ Input     │ 3.3V    │ ✓  │ Arrêt   │
+│  2   │ BTN_EMERGENCY     │ Button    │ Input     │ 3.3V    │ ✓  │ Urgence │
+│  3   │ SW_AUTO_MANUAL    │ Switch    │ Input     │ 3.3V    │ ✓  │ Mode    │
+│  4   │ SW_DIRECTION      │ Switch    │ Input     │ 3.3V    │ ✓  │ Sens    │
+│  5   │ ENCODER_CLK       │ Encoder   │ Input     │ 3.3V    │ ✓  │ Rotation│
+│  6   │ ENCODER_DT        │ Encoder   │ Input     │ 3.3V    │ ✓  │ Direction│
+│  7   │ ENCODER_SW        │ Button    │ Input     │ 3.3V    │ ✓  │ Fine/C. │
+│  8   │ STEPPER_STEP      │ Motor     │ Output    │ 3.3V    │ ✗  │ Pulse   │
+│  9   │ STEPPER_DIR       │ Motor     │ Output    │ 3.3V    │ ✗  │ Direction│
+│ 10   │ STEPPER_ENABLE    │ Motor     │ Output    │ 3.3V    │ ✗  │ Enable  │
+│ 12   │ I2C_SDA           │ I/O       │ I2C       │ 3.3V    │ E  │ Données │
+│ 13   │ I2C_SCL           │ I/O       │ I2C       │ 3.3V    │ E  │ Horloge │
+│ 26   │ PAL_INPUT         │ Analog    │ Input     │ 3.3V    │ ✗  │ ADC0    │
+└────────────────────────────────────────────────────────────────────────────┘
+
+LÉGENDE:
+PU = Pull-Up: ✓ Interne | ✗ Aucun | E = Externe
+
+================================================================================
+SECTION 3: CONFIGURATION MATÉRIELLE DÉTAILLÉE
+================================================================================
+
+3.1 ALIMENTATION
+─────────────────────────────────────────────────────────────────────────────
+
+Circuit d'alimentation:
+                    ┌─────────────┐
+                    │   +12V      │
+                    │  (Moteur)   │
+                    └──────┬──────┘
+                           │
+                      [L7812 Régulateur] ← Optionnel pour 5V issu de 12V
+                           │
+                    ┌──────┴──────┐
+                    │   +5V       │
+                    │  (Logic)    │
+                    └──────┬──────┘
+                           │
+                      [LDO 3.3V]
+                           │
+        ┌──────────────────┼──────────────────┐
+        │                  │                  │
+    RP2040        Driver Logique          Écran OLED
+    +3.3V              +5V                 +3.3V
+    GND (commun partout)
+
+Condensateurs de découplage:
+- 100µF électrolytique sur +12V (moteur)
+- 100nF sur +5V (driver logique)
+- 100nF sur +3.3V (RP2040)
+- 100nF sur +3.3V (écran OLED)
+
+3.2 BOUTONS POUSSOIRS (GPIO 0, 1, 2)
+─────────────────────────────────────────────────────────────────────────────
+
+Schéma de connexion (identique pour les 3 boutons):
+
+                    ┌─────────┐
+                    │ Bouton  │
+                    └────┬────┘
+                         │
+                        (Appuyé = GND)
+                         │
+    GPIO ────────────────┴────────────── GND
+    (Pull-up interne)
+
+État logique:
+- Reposé: GPIO = HIGH (3.3V)
+- Appuyé: GPIO = LOW (0V)
+
+Débounce: 200ms (logiciel)
+
+3.3 INTERRUPTEURS (GPIO 3, 4)
+─────────────────────────────────────────────────────────────────────────────
+
+Interrupteur AUTO/MANUEL (GPIO 3):
+                    ┌─ LOW (GND)   = AUTO
+                    │
+    GPIO 3 ◄────────┤
+                    │
+                    └─ HIGH (VCC)  = MANUEL
+
+Interrupteur DIRECTION (GPIO 4):
+                    ┌─ LOW (GND)   = AVANT
+                    │
+    GPIO 4 ◄────────┤
+                    │
+                    └─ HIGH (VCC)  = ARRIÈRE
+
+3.4 ENCODEUR ROTATIF KY-040 (GPIO 5, 6, 7)
+─────────────────────────────────────────────────────────────────────────────
+
+Pinout KY-040:
+    1. GND       → GND du RP2040
+    2. +VCC      → +3.3V du RP2040
+    3. SW (Button) → GPIO 7
+    4. CLK       → GPIO 5
+    5. DT        → GPIO 6
+
+Condensateurs de découplage:
+    +3.3V ──[100nF]── GND (près de l'encodeur)
+
+Fonctionnement:
+- Rotation CW/CCW détectée via CLK + DT
+- Pas: 100 Hz (mode normal) ou 1 Hz (bouton appuyé)
+- Fréquence: 0-20000 Hz
+
+3.5 ENTRÉE SIGNAL PAL (GPIO 26 - ADC0)
+─────────────────────────────────────────────────────────────────────────────
+
+Filtre RC passe-bas:
+                    ┌─────────────┐
+                    │ Caméra PAL  │ Signal 50Hz
+                    │ Sync OUT    │
+                    └─────────────┘
+                           │
+                       [R 10kΩ]
+                           │
+                    ┌──────┴──────┐
+                    │             │
+                GPIO 26       [C 100nF]
+                (ADC0)            │
+                    ├─────────────┤
+                    │
+                   GND
+
+Caractéristiques:
+- Fréquence: 50 Hz (PAL standard)
+- Tension: 3.3V peak (filtré)
+- Multiplicateur: ×200 = 10000 Hz
+- Tolérance sync: ±2%
+
+3.6 ÉCRAN OLED ELEGOO 1315 / SSD1306 (I2C: GPIO 12, 13)
+─────────────────────────────────────────────────────────────────────────────
+
+Connexions I2C:
+    RP2040              OLED (SSD1306)
+    ──────              ──────────────
+    GPIO 12 (SDA) ◄───► SDA
+    GPIO 13 (SCL) ◄───► SCL
+    +3.3V ◄───► VCC
+    GND ◄───► GND
+
+Condensateurs de découplage:
+    +3.3V ──[100nF]── GND (près de l'écran)
+
+I2C Configuration:
+- Adresse: 0x3C (standard)
+- Vitesse: 400kHz
+- Résolution: 128×64 pixels
+- Taux de rafraîchissement: 200ms
+
+Affichage:
+    ┌────────────────────────┐
+    │   ▓▓ 10000 Hz ▓▓       │  ← Zone 1: Fréquence (bleu)
+    │                        │
+    │      AUTO/MANUEL       │  ← Zone 2: Mode
+    │                        │
+    │   AVANT / ARRIÈRE      │  ← Zone 3: Direction
+    │  [ON/OFF] Statut       │  ← Zone 4: État moteur
+    └────────────────────────┘
+
+3.7 SORTIES MOTEUR (GPIO 8, 9, 10)
+─────────────────────────────────────────────────────────────────────────────
+
+Connexion au driver DRV8825/TB6600:
+
+RP2040                  Driver
+──────                  ──────
+GPIO 8 ────────────► STEP   (Impulsions moteur)
+GPIO 9 ────────────► DIR    (Direction rotation)
+GPIO 10 ───────────► ENABLE (Activation, Active LOW)
+
+Signal STEP:
+    Fréquence: 0-20000 Hz
+    Duty Cycle: 50%
+    Amplitude: 3.3V
+
+Signal DIR:
+    LOW  = Direction 1 (AVANT)
+    HIGH = Direction 2 (ARRIÈRE)
+
+Signal ENABLE:
+    LOW  = Driver actif
+    HIGH = Driver désactivé (moteur libre)
+
+3.8 DRIVER MOTEUR DRV8825 (Exemple)
+─────────────────────────────────────────────────────────────────────────────
+
+Pinout:
+    Pin 1: GND      ← GND (commun)
+    Pin 2: STEP     ← GPIO 8
+    Pin 3: DIR      ← GPIO 9
+    Pin 4: MS1      ← Configuration microstepping
+    Pin 5: MS2      ← Configuration microstepping
+    Pin 6: MS3      ← Configuration microstepping
+    Pin 7: ENABLE   ← GPIO 10 (Active LOW)
+    Pin 8: GND      ← GND (commun)
+    Pin 9: VMOT     ← +12V (alimentation moteur)
+    Pin 10: GND     ← GND (commun)
+    Pin 11: GND     ← GND (commun)
+    Pin 12: FAULT   ← Détection erreur (optionnel)
+    Pin 13: B2      ← Bobine B-
+    Pin 14: B1      ← Bobine B+
+    Pin 15: A1      ← Bobine A+
+    Pin 16: A2      ← Bobine A-
+
+Condensateurs:
+    VCP: [100nF] ── GND
+    VMOT: [100µF] ── GND (électrolytique)
+
+3.9 MOTEUR PAS À PAS NEMA17/23/34
+─────────────────────────────────────────────────────────────────────────────
+
+Pinout standard:
+    Câble A (Rouge) ──► Coil A+
+    Câble A (Vert)  ──► Coil A-
+    Câble B (Noir)  ──► Coil B+
+    Câble B (Bleu)  ──► Coil B-
+
+Caractéristiques typiques NEMA17:
+    - Couple: 0.4 Nm
+    - Courant: 1.5 A par bobine
+    - Pas: 1.8° (200 pas/tour)
+    - Tension: 12V DC
+
+Caractéristiques typiques NEMA23:
+    - Couple: 2.8 Nm
+    - Courant: 2.8 A par bobine
+    - Pas: 1.8° (200 pas/tour)
+    - Tension: 24V DC
+
+================================================================================
+SECTION 4: CODE PRINCIPAL - EXTRAITS CLÉS
+================================================================================
+
+4.1 CONFIGURATION DES PINS (Setup)
+─────────────────────────────────────────────────────────────────────────────
+
+void setup() {
+  // Entrées avec pull-up interne
+  pinMode(BTN_START_PIN, INPUT_PULLUP);      // GPIO 0
+  pinMode(BTN_STOP_PIN, INPUT_PULLUP);       // GPIO 1
+  pinMode(BTN_EMERGENCY_PIN, INPUT_PULLUP);  // GPIO 2
+  pinMode(SW_AUTO_MANUAL_PIN, INPUT_PULLUP); // GPIO 3
+  pinMode(SW_DIRECTION_PIN, INPUT_PULLUP);   // GPIO 4
+  pinMode(ENCODER_CLK_PIN, INPUT_PULLUP);    // GPIO 5
+  pinMode(ENCODER_DT_PIN, INPUT_PULLUP);     // GPIO 6
+  pinMode(ENCODER_SW_PIN, INPUT_PULLUP);     // GPIO 7
+  pinMode(PAL_INPUT_PIN, INPUT);             // GPIO 26 (ADC)
+
+  // Sorties moteur
+  pinMode(STEPPER_STEP_PIN, OUTPUT);         // GPIO 8
+  pinMode(STEPPER_DIR_PIN, OUTPUT);          // GPIO 9
+  pinMode(STEPPER_ENABLE_PIN, OUTPUT);       // GPIO 10
+
+  // I2C Écran OLED (automatique via Wire.begin())
+  // GPIO 12 (SDA) + GPIO 13 (SCL)
+
+  // Initialiser écran OLED à 0x3C
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("SSD1306 allocation failed");
+    while(1);
+  }
+}
+
+4.2 BOUCLE PRINCIPALE (Loop)
+─────────────────────────────────────────────────────────────────────────────
+
+void loop() {
+  // 1. Lecture des entrées (tous les 10ms)
+  readInputs();
+  
+  // 2. Gestion des événements
+  handleButtons();
+  handleManualEncoder();
+  
+  // 3. Calcul de la fréquence cible
+  updateTargetFrequency();
+  
+  // 4. Rampe d'accélération/décélération
+  handleAcceleration();
+  
+  // 5. Génération des pulses STEP
+  generateSteps();
+  
+  // 6. Mise à jour écran OLED (toutes les 200ms)
+  updateDisplay();
+  
+  // Délai de polling
+  delay(10);
+}
+
+4.3 GESTION DES RAMPES (Accélération/Décélération)
+─────────────────────────────────────────────────────────────────────────────
+
+void handleAcceleration() {
+  unsigned long now = millis();
+  
+  if (isAccelerating) {
+    unsigned long elapsed = now - accelStartTime;
+    
+    if (elapsed >= ACCEL_TIME) {
+      // Accélération terminée
+      isAccelerating = false;
+      currentFreq = targetFreq;
+    } else {
+      // Rampe linéaire d'accélération
+      float progress = (float)elapsed / ACCEL_TIME;
+      currentFreq = targetFreq * progress;
+    }
+  }
+  else if (isDecelerating) {
+    unsigned long decelDuration = isEmergencyStopping ? 
+                                   EMERGENCY_DECEL_TIME : 
+                                   DECEL_TIME;
+    unsigned long elapsed = now - decelStartTime;
+    
+    if (elapsed >= decelDuration) {
+      // Décélération terminée
+      isDecelerating = false;
+      currentFreq = 0;
+      digitalWrite(STEPPER_ENABLE_PIN, HIGH);  // Désactiver driver
+    } else {
+      // Rampe linéaire de décélération
+      float progress = 1.0 - ((float)elapsed / decelDuration);
+      currentFreq = targetFreq * progress;
+    }
+  }
+}
+
+4.4 GÉNÉRATION DES SIGNAUX MOTEUR (STEP)
+─────────────────────────────────────────────────────────────────────────────
+
+void generateSteps() {
+  if (currentFreq <= 0) {
+    stepInterval = 0;
+    return;
+  }
+  
+  // Calcul de l'intervalle entre les steps (µs)
+  // Fréquence = 2 steps par cycle (HIGH et LOW)
+  stepInterval = (unsigned long)(1000000.0 / (currentFreq * 2));
+  
+  // Génération des steps via polling
+  if (motorEnabled) {
+    unsigned long now = micros();
+    if ((now - lastStepTime) >= stepInterval) {
+      // Pulse STEP
+      digitalWrite(STEPPER_STEP_PIN, HIGH);
+      delayMicroseconds(5);
+      digitalWrite(STEPPER_STEP_PIN, LOW);
+      lastStepTime = now;
+    }
+  }
+}
+
+4.5 SYNCHRONISATION PAL (Mode AUTO)
+─────────────────────────────────────────────────────────────────────────────
+
+// ISR pour détection PAL
+void palDetectISR() {
+  unsigned long now = micros();
+  
+  if (lastPalTime > 0) {
+    unsigned long interval = now - lastPalTime;
+    // Filtre: PAL = 20ms ± 10%
+    if (interval > 18000 && interval < 22000) {
+      palFreq = 1000000.0 / interval;
+    }
+  }
+  lastPalTime = now;
+}
+
+// Maintien de l'alignement de phase
+void maintainPhaseAlignment() {
+  float syncTolerance = targetFreq * 0.02;  // ±2%
+  
+  if (currentFreq < (targetFreq - syncTolerance)) {
+    currentFreq += 10;  // Ajustement ascendant
+  } else if (currentFreq > (targetFreq + syncTolerance)) {
+    currentFreq -= 10;  // Ajustement descendant
+  }
+}
+
+4.6 AFFICHAGE OLED (200ms)
+─────────────────────────────────────────────────────────────────────────────
+
+void updateDisplay() {
+  static unsigned long lastDisplayUpdate = 0;
+  unsigned long now = millis();
+  
+  if ((now - lastDisplayUpdate) < 200) return;
+  lastDisplayUpdate = now;
+  
+  display.clearDisplay();
+  
+  // Zone haute: Fréquence (inverse vidéo)
+  display.fillRect(0, 0, 128, 20, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK);
+  display.setTextSize(2);
+  
+  char freqStr[20];
+  dtostrf(currentFreq, 5, 0, freqStr);
+  strcat(freqStr, " Hz");
+  
+  // Centrer le texte
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(freqStr, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((128 - w) / 2, 2);
+  display.println(freqStr);
+  
+  // Zone milieu: Mode
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(2);
+  display.setCursor(0, 32);
+  const char* modeStr = autoMode ? "AUTO" : "MANUEL";
+  display.getTextBounds(modeStr, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((128 - w) / 2, 32);
+  display.println(modeStr);
+  
+  // Zone basse: Direction et statut
+  display.setTextSize(1);
+  const char* dirStr = directionForward ? "AVANT" : "ARRIERE";
+  display.getTextBounds(dirStr, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((128 - w) / 2, 56);
+  display.println(dirStr);
+  
+  // Statut moteur
+  display.setCursor(0, 56);
+  display.println(motorEnabled ? "[ON]" : "[OFF]");
+  
+  display.display();
+}
+
+================================================================================
+SECTION 5: SPECIFICATIONS TECHNIQUES
+================================================================================
+
+5.1 FRÉQUENCE ET SYNCHRONISATION
+─────────────────────────────────────────────────────────────────────────────
+
+Mode Automatique (PAL):
+    Fréquence PAL:          50.0 Hz (standard)
+    Multiplicateur:         200×
+    Fréquence cible:        10000 Hz
+    Plage d'opération:      9000-11000 Hz (±10% pour tolérance)
+    Tolérance d'alignement: ±2%
+    Résolution:             ~1 Hz (via ajustement)
+
+Mode Manuel (Encodeur):
+    Plage minimale:         0 Hz
+    Plage maximale:         20000 Hz
+    Pas coarse (normal):    100 Hz
+    Pas fine (bouton):      1 Hz
+    Résolution totale:      1 Hz
+
+5.2 RAMPES D'ACCÉLÉRATION/DÉCÉLÉRATION
+───────────────────���─────────────────────────────────────────────────────────
+
+Accélération maximale:
+    Durée:                  2000 ms (configurable)
+    Profil:                 Linéaire
+    Démarrage:              0 Hz
+    Fin:                    fréquence cible
+    Pente:                  f_target / 2000 Hz/ms
+
+Décélération normale:
+    Durée:                  1500 ms (configurable)
+    Profil:                 Linéaire
+    Démarrage:              fréquence actuelle
+    Fin:                    0 Hz
+
+Arrêt d'urgence:
+    Durée:                  300 ms (configurable)
+    Profil:                 Linéaire ultra-rapide
+    Démarrage:              fréquence actuelle
+    Fin:                    0 Hz
+
+5.3 CONSOMMATION ÉLECTRIQUE (APPROXIMATIVE)
+─────────────────────────────────────────────────────────────────────────────
+
+RP2040-Zero:
+    @ 125MHz:               50 mA @ 3.3V
+    @ 200MHz:               80 mA @ 3.3V
+    Puissance:              165-260 mW
+
+Écran OLED (SSD1306):
+    En marche:              5-10 mA @ 3.3V
+    Puissance:              16-33 mW
+
+Driver Moteur (DRV8825):
+    En veille:              10 mA @ 5V
+    En fonctionnement:      100-500 mA @ 5V
+
+Moteur NEMA17:
+    Par bobine:             1.5 A @ 12V
+    Pleine charge:          3 A @ 12V
+    Puissance:              36-72 W
+
+TOTAL SYSTÈME:
+    Minimum (repos):        100 mA @ 5V + 10 mA @ 12V
+    Nominal (marche):       300 mA @ 5V + 1-2 A @ 12V
+    Maximum (marche forcée): 500 mA @ 5V + 3 A @ 12V
+
+5.4 TEMPS DE RÉPONSE
+─────────────────────────────────────────────────────────────────────────────
+
+Événement                   Temps        Notes
+─────────────────────────────────────────────────────────────────────────────
+Appui bouton → Action      50-100 ms    Débounce logiciel 200ms
+Changement encodeur → Update 10 ms      Polling principal
+Ordre MARCHE → Moteur       2000 ms     Temps accélération max
+Ordre ARRÊT → Moteur        1500 ms     Temps décélération
+Ordre URGENCE → Moteur      300 ms      Arrêt rapide
+Mise à jour écran           200 ms      Rafraîchissement OLED
+Synchronisation PAL         ±100 ms     Ajustement continu
+
+5.5 SPÉCIFICATIONS MOTEUR NEMA17
+─────────────────────────────────────────────────────────────────────────────
+
+Paramètre               Valeur
+────────────────────────────────────────────────────────────────
+Dimensions              42×42×34 mm
+Couple nominal          0.4 Nm
+Couple de maintien      0.35 Nm
+Courant par bobine      1.5 A
+Résistance par bobine   2.8 Ω
+Inductance par bobine   2.8 mH
+Pas angulaire           1.8°
+Pas par tour            200
+Fréquence max           1000 Hz (sans charge)
+Inertie moteur          0.0000275 kg·m²
+
+================================================================================
+SECTION 6: LISTES DE CONTRÔLE (CHECKLISTS)
+================================================================================
+
+6.1 AVANT L'INSTALLATION
+─────────────────────────────────────────────────────────────────────────────
+
+☐ Arduino IDE 2.0+ installé
+☐ Câble USB compatible (A → Micro/USB-C)
+☐ Tous les composants présents:
+  ☐ RP2040-Zero
+  ☐ Écran OLED SSD1306
+  ☐ Encodeur KY-040
+  ☐ 3 Boutons poussoirs
+  ☐ 2 Interrupteurs à bascule
+  ☐ Driver moteur (DRV8825 ou TB6600)
+  ☐ Moteur NEMA17/23/34
+  ☐ Caméra PAL ou générateur 50Hz
+  ☐ Condensateurs (100nF x4, 100µF x1)
+  ☐ Résistance 10kΩ
+  ☐ Câbles et connecteurs
+
+6.2 APRÈS L'INSTALLATION MATÉRIELLE
+─────────────────────────────────────────────────────────────────────────────
+
+☐ Vérifier alimentations:
+  ☐ +3.3V présent sur RP2040
+  ☐ +5V présent sur driver logique
+  ☐ +12V présent sur moteur
+  ☐ GND commun partout
+
+☐ Vérifier connexions GPIO:
+  ☐ Tous les boutons connectés (GPIO 0, 1, 2)
+  ☐ Tous les interrupteurs connectés (GPIO 3, 4)
+  ☐ Encodeur connecté (GPIO 5, 6, 7)
+  ☐ Moteur connecté (GPIO 8, 9, 10)
+  ☐ OLED connecté (GPIO 12, 13)
+  ☐ Signal PAL connecté (GPIO 26)
+
+☐ Vérifier les condensateurs:
+  ☐ 100nF sur VCC (x3 minimum)
+  ☐ 100µF sur VMOT
+
+6.3 APRÈS LA PROGRAMMATION
+─────────────────────────────────────────────────────────────────────────────
+
+☐ Serial Monitor en marche (115200 baud)
+☐ Messages de démarrage visibles:
+  ☐ "=== RP2040 PAL Stepper Controller ==="
+  ☐ "Setup completed"
+
+☐ Tests des entrées:
+  ☐ Appuyer START → message dans Serial Monitor
+  ☐ Appuyer STOP → message dans Serial Monitor
+  ☐ Appuyer EMERGENCY → message dans Serial Monitor
+  ☐ Tourner encodeur → fréquence change
+  ☐ Changer interrupteurs → modes changent
+
+☐ Tests des sorties:
+  ☐ Écran OLED affiche "0 Hz"
+  ☐ Écran affiche mode "AUTO" ou "MANUEL"
+  ☐ Écran affiche direction "AVANT" ou "ARRIÈRE"
+
+☐ Test moteur:
+  ☐ Appuyer START → moteur s'accélère
+  ☐ Appuyer ARRÊT → moteur décélère
+  ☐ Appuyer URGENCE → arrêt rapide
+  ☐ Changer direction → moteur change de sens (à l'arrêt)
+
+6.4 AVANT LA MISE EN PRODUCTION
+─────────────────────────────────────────────────────────────────────────────
+
+☐ Tous les tests réussissent
+☐ Aucun message d'erreur dans Serial Monitor
+☐ Moteur fonctionne sans vibration excessive
+☐ Synchronisation PAL stable (si mode AUTO)
+☐ Écran OLED lisible en marche
+☐ Tous les boutons/interrupteurs réactifs
+☐ Pas de court-circuit détecté
+☐ Ventilation adéquate pour le driver moteur
+☐ Câbles bien fixés (pas de débrancher accidentel)
+☐ Documentation complète conservée
+
+================================================================================
+SECTION 7: RESSOURCES ET RÉFÉRENCES
+================================================================================
+
+DATASHEETS:
+───────────
+RP2040:
+  https://datasheets.raspberrypi.com/rp2040/rp2040-datasheet.pdf
+  
+Waveshare RP2040-Zero:
+  https://www.waveshare.com/wiki/RP2040-Zero
+  
+DRV8825 Stepper Driver:
+  https://www.ti.com/lit/ds/symlink/drv8825.pdf
+  
+TB6600 Stepper Driver:
+  https://toshiba.semicon-storage.com/info/docget.jsp?did=13572
+  
+SSD1306 OLED:
+  https://cdn-shop.adafruit.com/datasheets/SSD1306.pdf
+
+BIBLIOTHÈQUES ARDUINO:
+─────────────────────
+Adafruit SSD1306:
+  https://github.com/adafruit/Adafruit_SSD1306
+  Version minimum: 2.5.0
+  
+Adafruit GFX Library:
+  https://github.com/adafruit/Adafruit-GFX-Library
+  Version minimum: 1.10.0
+  
+Earlephilhower Arduino-Pico:
+  https://github.com/earlephilhower/arduino-pico
+  Installation: URL JSON dans Arduino IDE
+
+TUTORIELS:
+──────────
+Arduino RP2040:
+  https://docs.arduino.cc/boards/rp2040/
+  
+Getting Started RP2040:
+  https://www.raspberrypi.com/documentation/microcontrollers/rp2040.html
+  
+I2C Communication:
+  https://learn.adafruit.com/adafruit-ssd1306-oled-displays/
+  
+Stepper Motor Control:
+  https://howtomechatronics.com/tutorials/arduino/stepper-motor-control-with-arduino/
+
+================================================================================
+SECTION 8: NOTES ET AVERTISSEMENTS
+================================================================================
+
+⚠️  AVERTISSEMENTS IMPORTANTS
+───────────────────────────────────────────────────────────────────────────────
+
+1. SÉCURITÉ ÉLECTRIQUE:
+   - Vérifier toutes les polarités avant mise sous tension
+   - Moteur en marche: risque de pincement
+   - Courant moteur: peut atteindre 3A, assurez une bonne ventilation
+   - Ne pas toucher le moteur pendant le fonctionnement
+
+2. SYNCHRONISATION PAL:
+   - Nécessite un signal 50Hz stable (ex: caméra PAL)
+   - La qualité du signal affecte la précision
+   - Filtre RC requis pour l'entrée ADC
+
+3. ENCODEUR ROTATIF:
+   - Mode fine: très sensible (1 Hz par cran)
+   - Risque de dépassement à haute fréquence
+   - Debounce logiciel: 200ms
+
+4. MOTEUR NEMA17:
+   - Couple limité (0.4 Nm nominale)
+   - Peut chauffer à fréquence élevée
+   - Vérifier l'isolation thermique du driver
+
+5. COMPILATEUR EARLEPHILHOWER:
+   - Compatible Arduino IDE 2.0+
+   - Non testé avec Arduino IDE 1.8 (ancienne version)
+   - Mettre à jour régulièrement pour les correctifs
+
+LIMITATIONS CONNUES
+───────────────────────────────────────────────────────────────────────────────
+
+1. Fréquence maximale: 20000 Hz (limitation du CPU @ 125MHz)
+2. Résolution de fréquence: ~1 Hz minimum
+3. Précision PAL: ±2% (dépendant du signal d'entrée)
+4. Écran OLED: Pas de support couleur
+5. Pas de retour d'encodeur (pas de confirmation mécanique)
+
+AMÉLIORATIONS FUTURES
+───────────────────────────────────────────────────────────────────────────────
+
+□ Support microstepping avancé (1/16, 1/32 pas)
+□ Sauvegarde des paramètres en EEPROM
+□ Liaison Bluetooth pour télécommande
+□ Affichage graphique de la rampe d'accélération
+□ Détection de surcharge moteur
+□ Historique des événements
+□ Mise à jour du firmware via USB
+□ Support de plusieurs moteurs (cascadé)
+
+================================================================================
+FIN DE LA DOCUMENTATION
+================================================================================
+
+Document généré: Septembre 2026
+Version: 1.0.0
+Auteur: Développement Arduino RP2040
+Licence: Informatif - À adapter selon besoins
+
+Pour obtenir un support technique:
+1. Consulter le fichier BROCHAGE.md
+2. Consulter le fichier INSTALLATION.md
+3. Vérifier le Serial Monitor (115200 baud)
+4. Créer une issue sur GitHub
+
+================================================================================
